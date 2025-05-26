@@ -204,12 +204,28 @@ def build_dataset(sample_finer: int | None = None, seed: int = 42, pct_test: flo
         # select exactly `tgt` examples, using `.select()` to return a Dataset
         return concatenated.select(range(tgt))
     
-    in_up  = up(ds_in["train"])
-    map_up = up(ds_map["train"])
-    fin_up = up(ds_fin["train"])
+    def balance_split(split, tgt: int = 100_000, seed: int = 42):
+        """
+        Return a Dataset of exactly `tgt` examples:
+        • If the input is larger → down-sample
+        • If smaller        → up-sample via `up()`
+        """
+        n = len(split)
+        if n > tgt:
+            return split.shuffle(seed=seed).select(range(tgt))
+        return up(split, tgt)
+
+    
+    target = 10_000
+    in_bal  = balance_split(ds_in["train"],  target, seed)
+    map_bal = balance_split(ds_map["train"], target, seed)
+    fin_bal = balance_split(ds_fin["train"], target, seed)
+
+
     print("UP TYPES")
-    print(type(in_up), type(map_up), type(fin_up))
-    pool = concatenate_datasets([in_up, map_up, fin_up]).shuffle(seed=seed)
+    print(type(in_bal), type(map_bal), type(fin_bal))
+
+    pool = concatenate_datasets([in_bal, map_bal, fin_bal]).shuffle(seed=seed)
 
     interim = pool.train_test_split(test_size=pct_test, seed=seed)
     tmp = interim["test"].train_test_split(test_size=0.5, seed=seed)
