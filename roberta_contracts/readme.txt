@@ -1,1 +1,0 @@
-uses the dataset "lawinsider/uk_ner_contracts_spacy" with a "roberta" model framework to create an alternative NER for contracts.
