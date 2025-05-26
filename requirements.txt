@@ -1,0 +1,5 @@
+spacy==3.2.6
+spacy-transformers==1.1.4
+torch==1.10.2
+numpy<2.0.0
+typing-extensions==4.5.0

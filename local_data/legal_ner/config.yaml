@@ -1,0 +1,63 @@
+BATCH_SIZE: 2
+MAX_EPOCHS: 20
+MAX_SEQUENCE_LEN: 256
+LEARNING_RATE: 1.0e-4
+WEIGHT_DECAY: 1.0e-6
+EARLY_STOPPING_THRESHOLD: 5
+
+SOURCE_COLUMN: "tokens"
+TARGET_COLUMN: "BIOES_tags"
+# "BIO_tags" or "BIOES_tags"
+
+MODEL_CHECKPOINT: "xlm-roberta-base"
+# distilbert-base-uncased 
+# law-ai/InLegalBERT
+# xlm-roberta-base
+# roberta-base
+VERSION: "v8"
+# v1 - regular finetunining on judgement data (BIO tagging)
+# v2 - regular finetuning with weighted CrossEntropyLoss on judgement data (BIO tagging)
+# v3 - regular finetuning with BIOES tagging on judgement data (BIOES tagging)
+# v4 - regualr finetuning on preamble data (BIO or BIOES tagging)
+# v5 - dual finetuning, preamble and judgement data # DISCUSS
+# v6 - regular finetuning extended with CRF (Conditional Random Fields) (BIO tagging)
+# v7 - regular finetuning extended with CRF (Conditional Random Fields) (BIOES tagging)
+EXTRACT_FORM: "combined"
+# "judgement" or "preamble" -> type of InLegal data
+
+USE_CRF: False # Conditional Random Fields 
+USE_ENSEMBLE: True # Whether to use Ensmble approach for prediction
+ENSEMBLE_TOKENIZER: "xlm-roberta-base"
+ENSEMBLE_MODELS: # path to trained NER models
+    MODEL_1: 
+        TYPE: "XLMRobertaforTokenClassification"
+        VERSION: "v3"
+        SOURCE_COLUMN: "tokens"
+        TARGET_COLUMN: "BIOES_tags"
+        USE_CRF: False
+        NUM_LABELS: 53
+        PATH: "./model_checkpoints/xlm-roberta-base_v3/xlm-roberta-base_v3_epoch_20_07-03-2023-21_00"
+    MODEL_2:
+        TYPE: "XLMRobertaCRFforTokenClassification"
+        VERSION: "v7"
+        SOURCE_COLUMN: "tokens"
+        TARGET_COLUMN: "BIOES_tags"
+        USE_CRF: True
+        NUM_LABELS: 56
+        PATH: "./model_checkpoints/xlm-roberta-base_v7/xlm-roberta-base_v7_epoch_10_21-03-2023-03_46"
+# NOTE: each `sub-model` under the `ensemble_models` should share the same encoder
+# since, target-labels are aligned with encoder's input_ids
+ENSEMBLING_TYPE: "soft"
+# `max` -> max-voting or mode
+# `soft`-> soft-voting of weighted average
+
+
+PATH_TO_DATA_DIR: "./data/" # path to data directory
+PATH_TO_CLASS_LABELS: "./data/combined_class_labels.pkl" # TODO: add preamble file
+# ./data/judgement_class_labels.pkl -> judgement_data_class_labels
+# ./data/preamble_class_labels.pkl -> preamble_data_class_labels
+# ./data/combined_class_labels.pkl -> combined judgement_data & preamble_data class_labels
+PATH_TO_RESULT_OUTPUT_DIR: "./results/" # path to results directory with `./results/val/` and `./results/test/` sub-directories
+PATH_TO_MODEL_OUTPUT_DIR: "./model_checkpoints/" # path to `trained (saved)` models directory
+
+
