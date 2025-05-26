@@ -1,5 +1,15 @@
-spacy==3.2.6
-spacy-transformers==1.1.4
-torch==1.10.2
-numpy<2.0.0
-typing-extensions==4.5.0
+
+--extra-index-url https://download.pytorch.org/whl/cu118
+
+torch==2.1.0+cu118
+torchvision==0.15.2+cu118
+torchaudio==2.1.0+cu118
+
+transformers>=4.32.0
+accelerate>=0.21.0
+bitsandbytes>=0.39.0
+peft>=0.15.2
+datasets>=2.13.0
+seqeval>=1.2.2
+matplotlib>=3.6.0
+huggingface_hub>=0.14.1

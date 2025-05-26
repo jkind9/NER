@@ -28,8 +28,10 @@ from datasets import (
 )
 from transformers import (
     AutoTokenizer, AutoModelForTokenClassification, TrainingArguments,
-    DataCollatorForTokenClassification, Trainer, EarlyStoppingCallback, pipeline
+    DataCollatorForTokenClassification, Trainer, EarlyStoppingCallback, pipeline,
+    BitsAndBytesConfig
 )
+
 
 try:
     from peft import LoraConfig, get_peft_model
@@ -248,15 +250,6 @@ def plot_history(trainer, out_png: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-    import argparse
-    from pathlib import Path
-    from transformers import Trainer, TrainingArguments, pipeline
-    from transformers import AutoTokenizer, AutoModelForTokenClassification
-    from transformers import DataCollatorForTokenClassification, EarlyStoppingCallback
-    from peft import LoraConfig, get_peft_model  # if installed
-    import torch
-    import matplotlib.pyplot as plt
-    from seqeval.metrics import precision_score, recall_score, f1_score, accuracy_score
 
     # 1) Argparse
     p = argparse.ArgumentParser()
@@ -276,7 +269,7 @@ def main():
         help="Disable LoRA (enabled by default)",
     )
     p.set_defaults(use_lora=True)
-    p.add_argument("--predict",         type=str,   default=None)
+    p.add_argument("--predict", type=str,   default=None)
     args = p.parse_args()
 
     # 2) Build / preprocess datasets
@@ -286,12 +279,33 @@ def main():
 
     # 3) Load & configure model
     if args.use_lora:
+        # 4-bit + LoRA setup via BitsAndBytesConfig
+
+        bnb_config = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",            # see docs for other options
+            bnb_4bit_compute_dtype=torch.float16, # float16 or float32
+            bnb_4bit_use_double_quant=True
+        )
+
         model = AutoModelForTokenClassification.from_pretrained(
             "nlpaueb/legal-bert-base-uncased",
             num_labels=len(labels),
-            load_in_4bit=True,
             device_map="auto",
+            quantization_config=bnb_config
         )
+        if not PEFT:
+            raise RuntimeError("peft not installed; rerun without --no_lora or install it")
+        model = get_peft_model(
+            model,
+            LoraConfig(
+                r=16,
+                lora_alpha=32,
+                target_modules=["query", "value"],
+                lora_dropout=0.05
+            )
+        )
+        model.gradient_checkpointing_enable()
         model = get_peft_model(
             model,
             LoraConfig(r=16, lora_alpha=32, target_modules=["query","value"], lora_dropout=0.05),
