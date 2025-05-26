@@ -1,0 +1,1 @@
+Tests the premade NER model from SpaCy created using Indian Legal Docs.

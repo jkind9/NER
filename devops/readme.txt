@@ -1,0 +1,1 @@
+Various functions and pseudo-code to create and test model apis in a docker container
