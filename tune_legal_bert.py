@@ -110,32 +110,3 @@ trainer = Trainer(
 )
 
 trainer.train()
-
-# ========== EVALUATE EACH CHECKPOINT ON TEST SET ==========
-test_results = []
-checkpoint_dir = training_args.output_dir
-
-for subdir in sorted(os.listdir(checkpoint_dir)):
-    path = os.path.join(checkpoint_dir, subdir)
-    if not subdir.startswith("checkpoint"):
-        continue
-    epoch = int(subdir.split("-")[-1])  # Assumes format: checkpoint-{step}
-    print(f"\n📊 Evaluating {subdir} on test set...")
-    model = AutoModelForTokenClassification.from_pretrained(path)
-    trainer.model = model
-    result = trainer.evaluate(tokenized_datasets["test"])
-    result["epoch"] = epoch
-    test_results.append(result)
-
-# ========== PLOT F1 SCORE BY EPOCH ==========
-epochs = [r["epoch"] for r in test_results]
-f1s = [r["eval_f1"] for r in test_results]
-
-plt.plot(epochs, f1s, marker="o")
-plt.title("Test F1 Score by Epoch Checkpoint")
-plt.xlabel("Epoch")
-plt.ylabel("F1 Score")
-plt.grid(True)
-plt.tight_layout()
-plt.savefig("test_f1_by_epoch.png")
-plt.show()

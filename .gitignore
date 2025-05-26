@@ -2,3 +2,5 @@ local_data/
 en_legal_ner_trf/
 ner_env/
 ner_model/
+final_model/
+tmp_eval/
