@@ -1,4 +1,7 @@
 local_data/
-en_legal_ner_trf/
 ner_env/
 ner_model/
+tmp_base_eval/
+tmp_eval/
+legal_bert_base_NER/contract_model/
+Trad_NER/final_model/
