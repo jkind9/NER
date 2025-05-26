@@ -250,84 +250,87 @@ def plot_history(trainer, out_png: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def main():
-
-    # 1) Argparse
+ # ─── 1) Arguments ─────────────────────────────────────────
     p = argparse.ArgumentParser()
-    p.add_argument("--output_dir",                    default="./eng_legal_ner_union")
-    p.add_argument("--num_train_epochs",   type=int, default=10)
+    p.add_argument("--output_dir",                        default="./eng_legal_ner_union")
+    p.add_argument("--num_train_epochs",       type=int, default=10)
     p.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    p.add_argument("--learning_rate",       type=float, default=2e-5)
+    p.add_argument("--learning_rate",         type=float, default=2e-5)
     p.add_argument("--per_device_train_batch_size", type=int, default=1)
     p.add_argument("--per_device_eval_batch_size",  type=int, default=4)
-    p.add_argument("--max_length",                  type=int, default=256)
-    p.add_argument("--sample_finer",      type=int, default=0)
-    # LoRA enabled by default; pass --no_lora to disable
+    p.add_argument("--max_length",                    type=int, default=256)
+    p.add_argument("--sample_finer",          type=int, default=0)
     p.add_argument(
         "--no_lora",
         dest="use_lora",
         action="store_false",
         help="Disable LoRA (enabled by default)",
     )
-    p.set_defaults(use_lora=True)
-    p.add_argument("--predict", type=str,   default=None)
+    p.set_defaults(use_lora=False)
+    p.add_argument("--predict",                    type=str,   default=None)
     args = p.parse_args()
 
-    # 2) Build / preprocess datasets
+    # ─── 2) Data ──────────────────────────────────────────────
     ds, labels = build_dataset(sample_finer=args.sample_finer)
     label_list_names = labels
     tokenizer = AutoTokenizer.from_pretrained("nlpaueb/legal-bert-base-uncased")
 
-    # 3) Load & configure model
+    # ─── 3) Model ─────────────────────────────────────────────
     if args.use_lora:
-        # 4-bit + LoRA setup via BitsAndBytesConfig
-
+        # 4-bit quant + LoRA
+        print("ATTEMPTING TO USE LORA")
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
-            bnb_4bit_quant_type="nf4",            # see docs for other options
-            bnb_4bit_compute_dtype=torch.float16, # float16 or float32
-            bnb_4bit_use_double_quant=True
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.float16,
+            bnb_4bit_use_double_quant=True,
         )
-
         model = AutoModelForTokenClassification.from_pretrained(
-            "nlpaueb/legal-bert-base-uncased",
-            num_labels=len(labels),
-            device_map="auto",
-            quantization_config=bnb_config
-        )
+        "nlpaueb/legal-bert-base-uncased",
+        num_labels=len(labels),
+        quantization_config=bnb_config,
+        
+        )   
         if not PEFT:
             raise RuntimeError("peft not installed; rerun without --no_lora or install it")
+
         model = get_peft_model(
             model,
             LoraConfig(
                 r=16,
                 lora_alpha=32,
-                target_modules=["query", "value"],
-                lora_dropout=0.05
-            )
+                target_modules=["query","value"],
+                lora_dropout=0.05,
+            ),
         )
         model.gradient_checkpointing_enable()
-        model = get_peft_model(
-            model,
-            LoraConfig(r=16, lora_alpha=32, target_modules=["query","value"], lora_dropout=0.05),
-        )
-        model.gradient_checkpointing_enable()
+
+        # Debug: how many params require grad?
+        total, trainable = 0, 0
+        for n, p in model.named_parameters():
+            total += p.numel()
+            if p.requires_grad:
+                trainable += p.numel()
+        print(f">>> model params: {total:,}, trainable: {trainable:,}")
     else:
+        print("NOT GOING TO USE LORA")
+
         model = AutoModelForTokenClassification.from_pretrained(
             "nlpaueb/legal-bert-base-uncased",
             num_labels=len(labels),
         )
         model.gradient_checkpointing_enable()
 
-    # 4) Tokenize & align (batched, throttled)
+    # ─── 4) Tokenize ──────────────────────────────────────────
     tok_ds = ds.map(
         lambda ex: tokenize_and_align(ex, tokenizer, args.max_length),
         batched=True,
         batch_size=64,
         remove_columns=ds["train"].column_names,
     )
-    data_collator = DataCollatorForTokenClassification(tokenizer)
+    collator = DataCollatorForTokenClassification(tokenizer)
 
-    # 5) Metrics function (using seqeval directly)
+    # ─── 5) Metrics ───────────────────────────────────────────
     def metric_fn(p):
         preds = p.predictions.argmax(-1)
         true_seqs, pred_seqs = [], []
@@ -341,11 +344,13 @@ def main():
             "accuracy":  accuracy_score(true_seqs, pred_seqs),
         }
 
-    # 6) TrainingArguments with memory optimizations
+    # ─── 6) TrainingArguments ─────────────────────────────────
     targs = TrainingArguments(
         output_dir=args.output_dir,
         evaluation_strategy="epoch",
         save_strategy="epoch",
+        load_best_model_at_end=True,
+        metric_for_best_model="f1",
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
@@ -353,10 +358,9 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         fp16=torch.cuda.is_available(),
         save_total_limit=2,
-        load_best_model_at_end=True,
-        metric_for_best_model="f1",
         report_to="none",
-        dataloader_num_workers=0,           # <-- avoid I/O spikes
+        dataloader_num_workers=0,
+        remove_unused_columns=False,
     )
 
     trainer = Trainer(
@@ -365,17 +369,16 @@ def main():
         train_dataset=tok_ds["train"],
         eval_dataset=tok_ds["validation"],
         tokenizer=tokenizer,
-        data_collator=data_collator,
+        data_collator=collator,
         compute_metrics=metric_fn,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
     )
 
-    # 7) Train or predict
+    # ─── 7) Train or Predict ─────────────────────────────────
     if args.predict is None:
         trainer.train()
         trainer.save_model()
         tokenizer.save_pretrained(args.output_dir)
-        # plot loss curve (re-use your existing helper)
         plot_history(trainer, Path(args.output_dir) / "training_curve.png")
         print(trainer.evaluate(tok_ds["test"], metric_key_prefix="test"))
     else:
