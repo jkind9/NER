@@ -38,18 +38,20 @@ try:
     PEFT = True
 except ImportError:
     PEFT = False
+
 from collections import Counter
 import json, os, logging
-import torch.nn as nn
+
+from torch.nn import CrossEntropyLoss
 
 MAP_FILE = r"C:\Users\jkind\Documents\NER\legal_bert_combination_datasets\label_maps.json"
 logger = logging.getLogger(__name__)
 
-class WeightedNERTrainer(Trainer):
-    def __init__(self, *args, class_weights=None, **kwargs):
-        super().__init__(*args, **kwargs)
-        # keep a loss function ready on the correct device
-        self.loss_fct = nn.CrossEntropyLoss(
+
+class WeightedTrainer(Trainer):
+    def __init__(self, class_weights, *args, **kw):
+        super().__init__(*args, **kw)
+        self.loss_fct = CrossEntropyLoss(
             weight=class_weights.to(self.args.device),
             ignore_index=-100,
         )
@@ -57,25 +59,64 @@ class WeightedNERTrainer(Trainer):
     def compute_loss(self, model, inputs, return_outputs=False):
         labels = inputs.pop("labels")
         outputs = model(**inputs)
-        logits = outputs.logits               # (B, T, C)
+        logits  = outputs.logits
         loss = self.loss_fct(
-            logits.view(-1, self.model.config.num_labels),
+            logits.view(-1, logits.size(-1)),
             labels.view(-1),
         )
         return (loss, outputs) if return_outputs else loss
+
     
-def make_class_weights(dataset, num_labels, ignore_idx=-100):
-    counts = Counter()
+
+def make_class_weights(
+    dataset,
+    num_labels: int,
+    label_names: list[str],
+    ignore_idx: int = -100,
+    power: float = 0.5,
+    max_o_weight: float = 0.05,
+    ):
+    """
+    Build a weight tensor for `nn.CrossEntropyLoss`.
+
+    Parameters
+    ----------
+    dataset       : iterable of dicts   – must contain `labels` key
+    num_labels    : int                – size of your output layer
+    label_names   : list[str]          – id → name lookup
+    ignore_idx    : int                – label id ignored in the loss (default -100)
+    power         : float              – use 1/(freq**power). 0.5 = √inv-freq
+    max_o_weight  : float              – cap for the ubiquitous 'O' label
+
+    Returns
+    -------
+    torch.FloatTensor of shape (num_labels,)
+    """
+
+    # 1) token counts per label id
+    counter = Counter()
     for ex in dataset:
-        counts.update([t for t in ex["labels"] if t != ignore_idx])
-    total = sum(counts.values())
-    # inverse frequency
-    inv_freq = torch.tensor(
-        [(total / counts.get(i, 1)) for i in range(num_labels)],
+        counter.update(t for t in ex["labels"] if t != ignore_idx)
+
+    # 2) raw inverse-frequency weights
+    total = sum(counter.values())
+    w = torch.tensor(
+        [
+            (total / counter.get(i, 1)) ** power   # smooth with *power*
+            for i in range(num_labels)
+        ],
         dtype=torch.float32,
     )
-    # normalise so mean == 1
-    return inv_freq / inv_freq.mean()
+
+    # 3) cap the overwhelming 'O' class
+    try:
+        o_idx = label_names.index("O")
+        w[o_idx] = min(w[o_idx], max_o_weight)
+    except ValueError:
+        pass  # no 'O' label in the schema
+
+    # 4) normalise so mean weight == 1
+    return w / w.mean()
 
 
 LABEL_ALL_TOKENS = False
@@ -98,32 +139,37 @@ def flatten_if_needed(ds: DatasetDict) -> DatasetDict:
     cols_to_remove = ds["train"].column_names  # keep only new keys
     return ds.map(_flat, remove_columns=cols_to_remove)
 
+def tokenize_and_align(batch, tok, max_len):
+    """
+    • batch["tokens"] and batch["ner_tags"] are lists of equal length
+    • returns a dict ready for 🤗 Trainer (adds "labels")
+    """
+    enc = tok(
+        batch["tokens"],
+        is_split_into_words=True,
+        truncation=True,
+        padding=False,        # let DataCollator pad
+        max_length=max_len,
+    )
 
-def detect_tag_col(ds_split):
-    """Return the first column that looks like a NER tag sequence."""
-    candidates = ("ner_tags", "tags", "coarse_grained", "fine_grained")
-    for c in candidates:
-        if c in ds_split.column_names:
-            return c
-    raise ValueError(f"No tag column found. Columns present: {ds_split.column_names}")
+    aligned = []
+    for sent_labels, encoding in zip(batch["ner_tags"], enc.encodings):
+        sent_aligned = []
+        prev_wid = None
+        for wid in encoding.word_ids:      # list[int|None]
+            if wid is None:                         # special / padding
+                sent_aligned.append(-100)
+            elif wid != prev_wid:                   # first sub-token
+                sent_aligned.append(sent_labels[wid])
+            else:                                   # other sub-tokens
+                sent_aligned.append(
+                    sent_labels[wid] if LABEL_ALL_TOKENS else -100
+                )
+            prev_wid = wid
+        aligned.append(sent_aligned)
 
-
-
-
-def tokenize_and_align(ex, tok, max_len):
-    enc = tok(ex["tokens"], truncation=True, is_split_into_words=True, max_length=max_len)
-    labels = []
-    for i, wids in enumerate(enc.word_ids(batch_index=i) for i in range(len(enc["input_ids"]))):
-        wl = ex["ner_tags"][i]; prev = None; row = []
-        for wid in wids:
-            if wid is None: row.append(-100)
-            elif wid != prev: row.append(wl[wid])
-            else: row.append(wl[wid] if LABEL_ALL_TOKENS else -100)
-            prev = wid
-        labels.append(row)
-    enc["labels"] = labels
+    enc["labels"] = aligned
     return enc
-
 
 def label_list(ds: DatasetDict) -> List[str]:
     return ds["train"].features["ner_tags"].feature.names
@@ -131,7 +177,6 @@ def label_list(ds: DatasetDict) -> List[str]:
 # ─────────────────────────────────────────────────────────────────────────────
 # Dataset union builder
 # ─────────────────────────────────────────────────────────────────────────────
-
 
 # ----------------------------------------------------------------------
 # Hard-coded map loader
@@ -433,14 +478,30 @@ def main():
         remove_columns=ds["train"].column_names,
     )
     collator = DataCollatorForTokenClassification(tokenizer)
-    class_weights = make_class_weights(tok_ds["train"], num_labels)
+    class_weights = make_class_weights(
+        tok_ds["train"],
+        num_labels=len(label_list_names),
+        label_names=label_list_names,
+    )
+
     # ─── 5) Metrics ───────────────────────────────────────────
     def metric_fn(p):
-        preds = p.predictions.argmax(-1)
+        # p.predictions : (B,T,C)  – logits
+        # p.label_ids   : (B,T)
+        logits, labels = p
+        preds = logits.argmax(-1)
+
         true_seqs, pred_seqs = [], []
-        for pred, lab in zip(preds, p.label_ids):
-            true_seqs.append([label_list_names[i] for i, l in zip(pred, lab) if l != -100])
-            pred_seqs.append([label_list_names[i] for i, l in zip(pred, lab) if l != -100])
+        for pred_row, lab_row in zip(preds, labels):
+            seq_true, seq_pred = [], []
+            for p_id, l_id in zip(pred_row, lab_row):
+                if l_id == -100:                # skip sub-tokens & padding
+                    continue
+                seq_true.append(label_list_names[l_id])
+                seq_pred.append(label_list_names[p_id])
+            true_seqs.append(seq_true)
+            pred_seqs.append(seq_pred)
+
         return {
             "precision": precision_score(true_seqs, pred_seqs),
             "recall":    recall_score(true_seqs, pred_seqs),
@@ -463,13 +524,13 @@ def main():
         max_steps=args.max_steps,           # use max_steps instead of num_train_epochs
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         fp16=torch.cuda.is_available(),
-        save_total_limit=2,
+        save_total_limit=5,
         report_to="none",
         dataloader_num_workers=0,
         remove_unused_columns=False,
     )
 
-    trainer = WeightedNERTrainer(
+    trainer = WeightedTrainer(
         model=model,
         args=targs,
         train_dataset=tok_ds["train"],
