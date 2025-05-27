@@ -38,6 +38,46 @@ try:
     PEFT = True
 except ImportError:
     PEFT = False
+from collections import Counter
+
+class WeightedNERTrainer(Trainer):
+    def __init__(self, *args, class_weights=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        # keep a loss function ready on the correct device
+        self.loss_fct = nn.CrossEntropyLoss(
+            weight=class_weights.to(self.args.device),
+            ignore_index=-100,
+        )
+
+    def compute_loss(self, model, inputs, return_outputs=False):
+        labels = inputs.pop("labels")
+        outputs = model(**inputs)
+        logits = outputs.logits               # (B, T, C)
+        loss = self.loss_fct(
+            logits.view(-1, self.model.config.num_labels),
+            labels.view(-1),
+        )
+        return (loss, outputs) if return_outputs else loss
+    
+def make_class_weights(train_ds, num_labels, ignore_idx=-100):
+    """
+    Return a 1-D torch tensor of length `num_labels`
+    with weights inversely proportional to class frequency.
+    """
+    counts = Counter()
+    for row in train_ds:
+        print(row)
+        counts.update(t for t in row["ner_tags"] if t != ignore_idx)
+
+    total = sum(counts.values())
+    # frequency, then inverse-frequency
+    inv_freq = torch.tensor(
+        [(total / counts.get(i, 1)) for i in range(num_labels)],
+        dtype=torch.float32,
+    )
+    # normalise so mean(weight) == 1
+    inv_freq /= inv_freq.mean()
+    return inv_freq
 
 LABEL_ALL_TOKENS = False
 
@@ -248,27 +288,88 @@ def plot_history(trainer, out_png: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 # Main
 # ─────────────────────────────────────────────────────────────────────────────
-
-def main():
- # ─── 1) Arguments ─────────────────────────────────────────
+def complete_args():
+    # ─── 1) Arguments ─────────────────────────────────────────
     p = argparse.ArgumentParser()
-    p.add_argument("--output_dir",                        default="./eng_legal_ner_union")
-    p.add_argument("--num_train_epochs",       type=int, default=10)
-    p.add_argument("--gradient_accumulation_steps", type=int, default=8)
-    p.add_argument("--learning_rate",         type=float, default=2e-5)
-    p.add_argument("--per_device_train_batch_size", type=int, default=1)
-    p.add_argument("--per_device_eval_batch_size",  type=int, default=4)
-    p.add_argument("--max_length",                    type=int, default=256)
-    p.add_argument("--sample_finer",          type=int, default=0)
+    p.add_argument(
+        "--output_dir",
+        default="./eng_legal_ner_union",
+        help="Where to save checkpoints & final model",
+    )
+    # step‐based training (instead of epochs)
+    p.add_argument(
+        "--max_steps",
+        type=int,
+        default=40000,
+        help="Total optimization steps (overrides num_train_epochs)",
+    )
+    p.add_argument(
+        "--eval_steps",
+        type=int,
+        default=1000,
+        help="Run evaluation every X steps",
+    )
+    p.add_argument(
+        "--save_steps",
+        type=int,
+        default=1000,
+        help="Save checkpoint every X steps",
+    )
+    p.add_argument(
+        "--gradient_accumulation_steps",
+        type=int,
+        default=3,
+        help="Accumulate gradients N times before stepping",
+    )
+    p.add_argument(
+        "--learning_rate",
+        type=float,
+        default=5e-5,
+        help="Initial learning rate",
+    )
+    p.add_argument(
+        "--per_device_train_batch_size",
+        type=int,
+        default=1,
+        help="Batch size per GPU/CPU for training",
+    )
+    p.add_argument(
+        "--per_device_eval_batch_size",
+        type=int,
+        default=4,
+        help="Batch size per GPU/CPU for evaluation",
+    )
+    p.add_argument(
+        "--max_length",
+        type=int,
+        default=256,
+        help="Max token length for inputs",
+    )
+    p.add_argument(
+        "--sample_finer",
+        type=int,
+        default=0,
+        help="If >0, subsample FiNER to this many examples",
+    )
+    # LoRA enabled by default; pass --no_lora to disable
     p.add_argument(
         "--no_lora",
         dest="use_lora",
         action="store_false",
-        help="Disable LoRA (enabled by default)",
+        help="Enable LoRA (disabled by default)",
     )
     p.set_defaults(use_lora=False)
-    p.add_argument("--predict",                    type=str,   default=None)
+    p.add_argument(
+        "--predict",
+        type=str,
+        default=None,
+        help="Run a prediction and exit, instead of training",
+    )
     args = p.parse_args()
+    return args
+
+def main():
+    args = complete_args()
 
     # ─── 2) Data ──────────────────────────────────────────────
     ds, labels = build_dataset(sample_finer=args.sample_finer)
@@ -277,43 +378,48 @@ def main():
 
     # ─── 3) Model ─────────────────────────────────────────────
     if args.use_lora:
-        # 4-bit quant + LoRA
+
         print("ATTEMPTING TO USE LORA")
+        # 1) Prepare 4-bit quantization
         bnb_config = BitsAndBytesConfig(
             load_in_4bit=True,
             bnb_4bit_quant_type="nf4",
             bnb_4bit_compute_dtype=torch.float16,
             bnb_4bit_use_double_quant=True,
         )
+        # 2) Load the quantized model
         model = AutoModelForTokenClassification.from_pretrained(
-        "nlpaueb/legal-bert-base-uncased",
-        num_labels=len(labels),
-        quantization_config=bnb_config,
-        
-        )   
+            "nlpaueb/legal-bert-base-uncased",
+            num_labels=len(labels),
+            quantization_config=bnb_config,
+        )
+        # 3) Move to GPU if available
+        if torch.cuda.is_available():
+            model.to("cuda")
+
         if not PEFT:
             raise RuntimeError("peft not installed; rerun without --no_lora or install it")
-
+        # 4) Apply LoRA adapters
         model = get_peft_model(
             model,
             LoraConfig(
                 r=16,
                 lora_alpha=32,
-                target_modules=["query","value"],
+                target_modules=["query", "value"],
                 lora_dropout=0.05,
             ),
         )
-        model.gradient_checkpointing_enable()
 
-        # Debug: how many params require grad?
+        # Debug: count total vs. trainable parameters
         total, trainable = 0, 0
-        for n, p in model.named_parameters():
+        for _, p in model.named_parameters():
             total += p.numel()
             if p.requires_grad:
                 trainable += p.numel()
         print(f">>> model params: {total:,}, trainable: {trainable:,}")
+        
     else:
-        print("NOT GOING TO USE LORA")
+        print("NOT USING LORA")
 
         model = AutoModelForTokenClassification.from_pretrained(
             "nlpaueb/legal-bert-base-uncased",
@@ -347,14 +453,16 @@ def main():
     # ─── 6) TrainingArguments ─────────────────────────────────
     targs = TrainingArguments(
         output_dir=args.output_dir,
-        evaluation_strategy="epoch",
-        save_strategy="epoch",
+        evaluation_strategy="steps",        # run evaluation every eval_steps
+        eval_steps=args.eval_steps,         # how often to evaluate
+        save_strategy="steps",              # save checkpoint every save_steps
+        save_steps=args.save_steps,         # how often to save
         load_best_model_at_end=True,
         metric_for_best_model="f1",
         learning_rate=args.learning_rate,
         per_device_train_batch_size=args.per_device_train_batch_size,
         per_device_eval_batch_size=args.per_device_eval_batch_size,
-        num_train_epochs=args.num_train_epochs,
+        max_steps=args.max_steps,           # use max_steps instead of num_train_epochs
         gradient_accumulation_steps=args.gradient_accumulation_steps,
         fp16=torch.cuda.is_available(),
         save_total_limit=2,
@@ -371,7 +479,7 @@ def main():
         tokenizer=tokenizer,
         data_collator=collator,
         compute_metrics=metric_fn,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=2)],
+        callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
     )
 
     # ─── 7) Train or Predict ─────────────────────────────────
