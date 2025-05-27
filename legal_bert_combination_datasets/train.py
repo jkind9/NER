@@ -32,13 +32,18 @@ from transformers import (
     BitsAndBytesConfig
 )
 
-
+from pprint import pprint
 try:
     from peft import LoraConfig, get_peft_model
     PEFT = True
 except ImportError:
     PEFT = False
 from collections import Counter
+import json, os, logging
+import torch.nn as nn
+
+MAP_FILE = r"C:\Users\jkind\Documents\NER\legal_bert_combination_datasets\label_maps.json"
+logger = logging.getLogger(__name__)
 
 class WeightedNERTrainer(Trainer):
     def __init__(self, *args, class_weights=None, **kwargs):
@@ -59,25 +64,19 @@ class WeightedNERTrainer(Trainer):
         )
         return (loss, outputs) if return_outputs else loss
     
-def make_class_weights(train_ds, num_labels, ignore_idx=-100):
-    """
-    Return a 1-D torch tensor of length `num_labels`
-    with weights inversely proportional to class frequency.
-    """
+def make_class_weights(dataset, num_labels, ignore_idx=-100):
     counts = Counter()
-    for row in train_ds:
-        print(row)
-        counts.update(t for t in row["ner_tags"] if t != ignore_idx)
-
+    for ex in dataset:
+        counts.update([t for t in ex["labels"] if t != ignore_idx])
     total = sum(counts.values())
-    # frequency, then inverse-frequency
+    # inverse frequency
     inv_freq = torch.tensor(
         [(total / counts.get(i, 1)) for i in range(num_labels)],
         dtype=torch.float32,
     )
-    # normalise so mean(weight) == 1
-    inv_freq /= inv_freq.mean()
-    return inv_freq
+    # normalise so mean == 1
+    return inv_freq / inv_freq.mean()
+
 
 LABEL_ALL_TOKENS = False
 
@@ -110,45 +109,6 @@ def detect_tag_col(ds_split):
 
 
 
-def ensure_int_tags(ds: DatasetDict, tag_col: str) -> DatasetDict:
-    """
-    • Renames the given tag column to `ner_tags`.
-    • Guarantees tags are integers backed by ClassLabel.
-    • Removes the original tag column from the feature dict before casting.
-    """
-    first_val = ds["train"][tag_col][0][0]          # peek at first tag
-    tags_are_int = isinstance(first_val, (int, bool))
-
-    # ------ 1. Build ClassLabel ------------------------------------------------
-    if tags_are_int:
-        max_id = max(max(row) for row in ds["train"][tag_col])
-        cl = ClassLabel(num_classes=max_id + 1)
-        convert = False
-    else:
-        vocab = sorted({t for row in ds["train"][tag_col] for t in row})
-        cl = ClassLabel(names=vocab)
-        convert = True
-
-    # ------ 2. Optionally convert strings → ints ------------------------------
-    if convert:
-        def to_int(ex):
-            ex["ner_tags"] = [cl.str2int(t) for t in ex[tag_col]]
-            return ex
-        ds = ds.map(to_int, remove_columns=[tag_col])
-    else:
-        if tag_col != "ner_tags":
-            ds = ds.rename_column(tag_col, "ner_tags")
-
-    # ------ 3. Re-create Features *after* column removal ----------------------
-    new_features = Features(
-        {
-            **{k: v for k, v in ds["train"].features.items() if k != "ner_tags"},
-            "ner_tags": Sequence(cl),
-        }
-    )
-
-    return ds.cast(new_features)
-
 
 def tokenize_and_align(ex, tok, max_len):
     enc = tok(ex["tokens"], truncation=True, is_split_into_words=True, max_length=max_len)
@@ -172,100 +132,99 @@ def label_list(ds: DatasetDict) -> List[str]:
 # Dataset union builder
 # ─────────────────────────────────────────────────────────────────────────────
 
-def build_dataset(sample_finer: int | None = None, seed: int = 42, pct_test: float = 0.05):
-    base = "C:/Users/jkind/Documents/NER/local_data/inlegalner_tokenized"
 
-    ds_in = load_dataset(
+# ----------------------------------------------------------------------
+# Hard-coded map loader
+# ----------------------------------------------------------------------
+def load_manual_map() -> dict[str, dict] | None:
+    if os.path.exists(MAP_FILE):
+        with open(MAP_FILE, "r") as fh:
+            data = json.load(fh)
+            return data
+    return None
+MANUAL_MAPS = load_manual_map()
+# ----------------------------------------------------------------------
+# 1. InLegal loader  → tokens, ner_tags (str)
+# ----------------------------------------------------------------------
+def load_inlegal(base_dir: str) -> DatasetDict:
+    ds = load_dataset(
         "arrow",
         data_files={
-            "train": f"{base}/train.arrow/*.arrow",
-            "validation": f"{base}/dev.arrow/*.arrow",
-            "test": f"{base}/test.arrow/*.arrow",
+            "train": f"{base_dir}/train.arrow/*.arrow",
+            "validation": f"{base_dir}/dev.arrow/*.arrow",
+            "test": f"{base_dir}/test.arrow/*.arrow",
         },
     )
-    ds_map = flatten_if_needed(load_dataset("joelniklaus/mapa").filter(lambda e: e.get("language", "en") == "en"))
-    ds_fin = flatten_if_needed(load_dataset("nlpaueb/finer-139"))
+    id2name = {int(k): v for k, v in MANUAL_MAPS["inlegal"].items()}
 
-    if sample_finer:
-        ds_fin["train"] = ds_fin["train"].shuffle(seed=seed).select(range(sample_finer))
+    def convert(ex):
+        ex["ner_tags"] = [id2name[i] for i in ex["ner_tags"]]
+        return ex
 
-    ds_in  = ensure_int_tags(ds_in,  detect_tag_col(ds_in["train"]))
-    ds_map = ensure_int_tags(ds_map, detect_tag_col(ds_map["train"]))
-    ds_fin = ensure_int_tags(ds_fin, detect_tag_col(ds_fin["train"]))
+    ds = ds.map(convert)
+    ds = ds.remove_columns([c for c in ds["train"].column_names if c not in {"tokens","ner_tags"}])
+    return ds
 
-    labels = sorted(set(label_list(ds_in)) | set(label_list(ds_map)) | set(label_list(ds_fin)))
-    id_map = {l: i for i, l in enumerate(labels)}
+# ----------------------------------------------------------------------
+# 2. MAPA loader  → tokens, ner_tags (str)
+# ----------------------------------------------------------------------
+def load_mapa() -> DatasetDict:
+    ds = load_dataset("joelniklaus/mapa").filter(lambda e: e.get("language","en")=="en")
+    # keep "tokens" + "coarse_grained"
+    def rename(ex):
+        ex["ner_tags"] = ex["coarse_grained"]
+        return ex
+    ds = ds.map(rename)
+    ds = ds.remove_columns([c for c in ds["train"].column_names if c not in {"tokens","ner_tags"}])
+    return ds
 
-    def _remap(ds_dict: DatasetDict, labels: list[str]) -> DatasetDict:
-        """
-        Take a DatasetDict with a 'ner_tags' column of ints,
-        and remap every tag to the new union label space.
-        Returns a brand-new DatasetDict (never a plain dict).
-        """
-        # build old_id -> new_id mapping
-        src_names = ds_dict["train"].features["ner_tags"].feature.names
-        name2new  = {name: i for i, name in enumerate(labels)}
-        mapping   = {old_id: name2new[src_names[old_id]] for old_id in range(len(src_names))}
+# ----------------------------------------------------------------------
+# 3. Merge helper
+# ----------------------------------------------------------------------
+def cast_to_labels(ds: DatasetDict, all_labels: list[str]) -> DatasetDict:
+    feat = Features({
+        "tokens": ds["train"].features["tokens"],
+        "ner_tags": Sequence(ClassLabel(names=all_labels)),
+    })
+    name2id = {n:i for i,n in enumerate(all_labels)}
 
-        # feature schema for the remapped ner_tags
-        new_feats = ds_dict["train"].features.copy()
-        new_feats["ner_tags"] = Sequence(ClassLabel(names=labels))
+    def to_ids(ex):
+        ex["ner_tags"] = [name2id[t] for t in ex["ner_tags"]]
+        return ex
 
-        def convert(ex):
-            ex["ner_tags"] = [mapping[i] for i in ex["ner_tags"]]
-            return ex
+    return ds.map(to_ids).cast(feat)
 
-        remapped_splits = {}
-        for split_name, ds in ds_dict.items():
-            # ds is a Dataset; map it *with* the new schema
-            remapped_splits[split_name] = ds.map(
-                convert,
-                features=new_feats,
-                batched=False,    # your tags are per-example
-            )
+# ----------------------------------------------------------------------
+# 4. Public function
+# ----------------------------------------------------------------------
+def build_dataset(seed: int = 42) -> tuple[DatasetDict, list[str]]:
+    in_ds   = load_inlegal(base_dir=r"C:\Users\jkind\Documents\NER\local_data\inlegalner_tokenized")
+    mapa_ds = load_mapa()
 
-        return DatasetDict(remapped_splits)
-    
-    ds_in  = _remap(ds_in, labels)
-    ds_map = _remap(ds_map, labels)
-    ds_fin = _remap(ds_fin, labels)
+    # log raw vocabularies
+    for name, ds in [("INLEGAL", in_ds), ("MAPA", mapa_ds)]:
+        vocab = {t for split in ds for ex in ds[split]["ner_tags"] for t in ex}
+        logger.info("[%s] tag vocab (%d): %s", name, len(vocab), sorted(vocab))
 
-    def up(split, tgt: int = 100_000):
-        """
-        Ensure `split` has at least `tgt` examples by up-sampling.
-        Always returns a `Dataset`, never a plain dict.
-        """
-        n = len(split)
-        if n >= tgt:
-            return split
-        # calculate how many times to repeat the dataset
-        reps = -(-tgt // n)  # ceiling division
-        concatenated = concatenate_datasets([split] * reps)
-        # select exactly `tgt` examples, using `.select()` to return a Dataset
-        return concatenated.select(range(tgt))
-    
-    def balance_split(split, tgt: int = 100_000, seed: int = 42):
-        """
-        Return a Dataset of exactly `tgt` examples:
-        • If the input is larger → down-sample
-        • If smaller        → up-sample via `up()`
-        """
-        n = len(split)
-        if n > tgt:
-            return split.shuffle(seed=seed).select(range(tgt))
-        return up(split, tgt)
+    # union of label strings
+    label_set = sorted(
+        {t for split in in_ds  for ex in in_ds[split]["ner_tags"]  for t in ex} |
+        {t for split in mapa_ds for ex in mapa_ds[split]["ner_tags"] for t in ex}
+    )
+    logger.info("Unified label set (%d): %s", len(label_set), label_set)
 
-    
-    target = 10_000
-    in_bal  = balance_split(ds_in["train"],  target, seed)
-    map_bal = balance_split(ds_map["train"], target, seed)
-    fin_bal = balance_split(ds_fin["train"], target, seed)
+    # cast each corpus to int-encoded tags sharing the same ClassLabel
+    in_ds   = cast_to_labels(in_ds,   label_set)
+    mapa_ds = cast_to_labels(mapa_ds, label_set)
 
-    pool = concatenate_datasets([in_bal, map_bal, fin_bal]).shuffle(seed=seed)
-
-    interim = pool.train_test_split(test_size=pct_test, seed=seed)
-    tmp = interim["test"].train_test_split(test_size=0.5, seed=seed)
-    return DatasetDict(train=interim["train"], validation=tmp["train"], test=tmp["test"]), labels
+    # concatenate train splits (keep individual dev/test for now)
+    train_pool = concatenate_datasets([in_ds["train"], mapa_ds["train"]]).shuffle(seed=seed)
+    merged = DatasetDict(
+        train=train_pool,
+        validation=concatenate_datasets([in_ds["validation"], mapa_ds["validation"]]),
+        test=concatenate_datasets([in_ds["test"], mapa_ds["test"]]),
+    )
+    return merged, label_set
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Plot helper
@@ -290,7 +249,15 @@ def plot_history(trainer, out_png: Path):
 # ─────────────────────────────────────────────────────────────────────────────
 def complete_args():
     # ─── 1) Arguments ─────────────────────────────────────────
+
     p = argparse.ArgumentParser()
+    p.add_argument(
+        "--log_level",
+        type=str,
+        default="INFO",
+        choices=["DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL"],
+        help="Set the logging level (default: INFO)",
+    )
     p.add_argument(
         "--output_dir",
         default="./eng_legal_ner_union",
@@ -370,11 +337,40 @@ def complete_args():
 
 def main():
     args = complete_args()
+    # ─── 1) Logger ──────────────────────────────────────────────
+
+    logging.basicConfig(
+        format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        level=getattr(logging, args.log_level),
+    )
+    logger.info("Starting with log level %s", args.log_level)
+
 
     # ─── 2) Data ──────────────────────────────────────────────
-    ds, labels = build_dataset(sample_finer=args.sample_finer)
+    ds, labels = build_dataset()
     label_list_names = labels
-    tokenizer = AutoTokenizer.from_pretrained("nlpaueb/legal-bert-base-uncased")
+
+    
+    def count_labels(dataset):
+        counter = Counter()
+        for row in dataset["ner_tags"]:
+            counter.update(row)
+        return counter
+
+    print("▶ Class distribution (train):")
+    train_counts = count_labels(ds["train"])
+    pprint({labels[k]: v for k, v in train_counts.items()})
+
+    print("\n▶ Class distribution (validation):")
+    val_counts = count_labels(ds["validation"])
+    pprint({labels[k]: v for k, v in val_counts.items()})
+
+    print("\n▶ Class distribution (test):")
+    test_counts = count_labels(ds["test"])
+    pprint({labels[k]: v for k, v in test_counts.items()})
+
+    num_labels = len(labels)
+
 
     # ─── 3) Model ─────────────────────────────────────────────
     if args.use_lora:
@@ -417,7 +413,7 @@ def main():
             if p.requires_grad:
                 trainable += p.numel()
         print(f">>> model params: {total:,}, trainable: {trainable:,}")
-        
+
     else:
         print("NOT USING LORA")
 
@@ -428,6 +424,8 @@ def main():
         model.gradient_checkpointing_enable()
 
     # ─── 4) Tokenize ──────────────────────────────────────────
+    tokenizer = AutoTokenizer.from_pretrained("nlpaueb/legal-bert-base-uncased")
+
     tok_ds = ds.map(
         lambda ex: tokenize_and_align(ex, tokenizer, args.max_length),
         batched=True,
@@ -435,7 +433,7 @@ def main():
         remove_columns=ds["train"].column_names,
     )
     collator = DataCollatorForTokenClassification(tokenizer)
-
+    class_weights = make_class_weights(tok_ds["train"], num_labels)
     # ─── 5) Metrics ───────────────────────────────────────────
     def metric_fn(p):
         preds = p.predictions.argmax(-1)
@@ -453,10 +451,10 @@ def main():
     # ─── 6) TrainingArguments ─────────────────────────────────
     targs = TrainingArguments(
         output_dir=args.output_dir,
-        evaluation_strategy="steps",        # run evaluation every eval_steps
-        eval_steps=args.eval_steps,         # how often to evaluate
-        save_strategy="steps",              # save checkpoint every save_steps
-        save_steps=args.save_steps,         # how often to save
+        evaluation_strategy="steps",       
+        eval_steps=args.eval_steps,         
+        save_strategy="steps",             
+        save_steps=args.save_steps,         
         load_best_model_at_end=True,
         metric_for_best_model="f1",
         learning_rate=args.learning_rate,
@@ -471,7 +469,7 @@ def main():
         remove_unused_columns=False,
     )
 
-    trainer = Trainer(
+    trainer = WeightedNERTrainer(
         model=model,
         args=targs,
         train_dataset=tok_ds["train"],
@@ -480,6 +478,7 @@ def main():
         data_collator=collator,
         compute_metrics=metric_fn,
         callbacks=[EarlyStoppingCallback(early_stopping_patience=5)],
+        class_weights=class_weights,      
     )
 
     # ─── 7) Train or Predict ─────────────────────────────────
@@ -489,6 +488,11 @@ def main():
         tokenizer.save_pretrained(args.output_dir)
         plot_history(trainer, Path(args.output_dir) / "training_curve.png")
         print(trainer.evaluate(tok_ds["test"], metric_key_prefix="test"))
+        with open(Path(args.output_dir) / "label2id.json", "w") as f:
+            json.dump({l: i for i, l in enumerate(labels)}, f, indent=2)
+
+        with open(Path(args.output_dir) / "id2label.json", "w") as f:
+            json.dump({i: l for i, l in enumerate(labels)}, f, indent=2)
     else:
         nlp = pipeline(
             "token-classification",
